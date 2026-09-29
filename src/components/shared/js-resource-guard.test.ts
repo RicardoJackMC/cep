@@ -49,6 +49,15 @@ describe('JS_RESOURCE_GUARD_CODE', () => {
     expect(JS_RESOURCE_GUARD_CODE).toContain('addEventListener')
   })
 
+  it('repairs the HTTP cache instead of re-inserting cache-busted URLs', () => {
+    // cache:'reload' bypasses AND overwrites a poisoned entry (404 cached with a
+    // long max-age). The old cache-busted re-insertion could not make the app
+    // hydrate, so no cache-buster URLs may come back.
+    expect(JS_RESOURCE_GUARD_CODE).toContain("cache:'reload'")
+    expect(JS_RESOURCE_GUARD_CODE).toContain('repairAll')
+    expect(JS_RESOURCE_GUARD_CODE).not.toContain('_r=')
+  })
+
   it('contains the four-locale copy table and the environment-info block', () => {
     expect(JS_RESOURCE_GUARD_CODE).toContain('zh-TW')
     expect(JS_RESOURCE_GUARD_CODE).toContain('"ja"')

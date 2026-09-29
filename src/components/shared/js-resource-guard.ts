@@ -21,14 +21,17 @@ import {
  *      /_next/static/ or /guards.js.
  *   2. After window.load (+ a 15s hang fallback) audit: if failures exist and
  *      the app never hydrated (no `data-cep-hydrated` sentinel on <html>),
- *      AUTO-RETRY the failed resources once (cache-busted re-insertion, no
- *      page reload). Only if they still fail does the full-screen fallback
- *      appear — a transient CDN blip self-heals without any user-visible
- *      disruption.
- *   3. Fallback page (zero external deps): failing URLs + "重试加载"
- *      (re-inserts the failed scripts with a cache-buster) + "刷新页面".
- *      Buttons are bound via addEventListener (inline `onclick` attributes
- *      can be blocked by CSP script-src-attr).
+ *      AUTO-REPAIR once: each failing URL is re-fetched with
+ *      `fetch(url,{cache:'reload'})`. That mode bypasses AND overwrites the
+ *      stored response, so a poisoned cache entry (e.g. a 404 cached with
+ *      `max-age=31536000`) is replaced by the real file, and one reload then
+ *      boots the app from the untouched URLs in the HTML. A transient CDN blip
+ *      or a bad cached response self-heals without user action; only when the
+ *      repair cannot obtain a healthy response does the fallback appear.
+ *   3. Fallback page (zero external deps): failing URLs + "重试加载" (repair
+ *      + reload) + "刷新页面" (clears both guard budgets, reloads, and re-arms
+ *      the automatic repair). Buttons are bound via addEventListener (inline
+ *      `onclick` attributes can be blocked by CSP script-src-attr).
  *   4. The error page is localized from the URL's first path segment
  *      ([locale]/...); outside a locale route (e.g. /404.html) no overlay is
  *      shown — the 404 page owns that surface.
@@ -126,10 +129,6 @@ var onErr=function(e){
   var t=e.target;
   if(!t||!t.tagName)return;
   var url=(t.src||t.href||'');
-  /* Retry requests carry a _r= cache-buster; their outcome is tracked by
-     retry()'s own onload/onerror handlers. Recording them here too would
-     duplicate the resource in the failure list (raw URL + retry URL). */
-  if(url.indexOf('_r=')>=0)return;
   if(!isCritical(url))return;
   if(F.indexOf(url)>=0)return;
   F.push(url);
@@ -153,38 +152,43 @@ function tryAudit(){
     }
     if(hydrated()){
       try{console.warn('[JS Guard] non-critical chunk failures',F);}catch(e){}
+      /* 页面已经可用:不弹错误页、不打断用户,只把这次失败命中的中毒缓存条目
+         悄悄换掉(懒加载 chunk、CSS、字体、图片的失败也会走到这里),下次请求即恢复。 */
+      repairAll(function(){});
       return;
     }
-    /* Auto-retry the failed resources once (cache-busted re-insertion, no
-       page reload). Only if they still fail do we surface the error page. */
+    /* One automatic repair per tab session. A cached error response never
+       resolves on its own, so repair the HTTP-cache entries and reload once;
+       the budget is re-armed as soon as a page in this tab hydrates. */
     var retried=false;
     try{retried=sessionStorage.getItem(RETRY_KEY)==='1';}catch(e){}
-    if(!retried){
-      try{sessionStorage.setItem(RETRY_KEY,'1');}catch(e){}
-      autoRetry(locale);
-      return;
-    }
-    show(locale);
+    if(retried){show(locale);return;}
+    try{sessionStorage.setItem(RETRY_KEY,'1');}catch(e){}
+    repairAll(function(ok){
+      if(ok){try{window.location.reload();return;}catch(e){}}
+      show(locale);
+    });
   })});
 }
 
-function autoRetry(locale){
-  retry();
-  /* Let the re-inserted scripts settle: loaded ones leave F, failed ones
-     stay. If the page hydrated, we are done. Otherwise surface the error
-     page once the retry outcome is known. */
-  setTimeout(function(){
-    /* 重试成功后页面完成 hydration:清除 RETRY_KEY,让同会话后续页面
-       加载仍能获得一次自动重试预算。 */
-    if(hydrated()){
-      try{sessionStorage.removeItem(RETRY_KEY);}catch(e){}
-      return;
-    }
-    if(F.length>0){show(locale);return;}
-    setTimeout(function(){
-      if(!hydrated()&&F.length>0)show(locale);
-    },2000);
-  },3000);
+/* Overwrite poisoned HTTP-cache entries: fetch(url,{cache:'reload'}) skips the
+   stored response and stores the fresh one under the same URL, so the untouched
+   <script>/<link> URLs in the HTML work again after a reload. Reports true only
+   when every failing URL came back ok; a throw, a non-ok response or a hang
+   counts as failure so the caller shows the error page instead of reloading. */
+function repairAll(cb){
+  var urls=F.slice(),pending=urls.length,ok=pending>0,settled=false,timer;
+  function finish(pass){if(settled)return;settled=true;if(timer)clearTimeout(timer);cb(pass);}
+  if(!pending){finish(false);return;}
+  if(typeof fetch!=='function'){finish(false);return;}
+  timer=setTimeout(function(){finish(false);},10000);
+  function settle(){pending--;if(pending<=0)finish(ok);}
+  for(var i=0;i<urls.length;i++){(function(u){
+    var p;
+    try{p=fetch(u,{cache:'reload'});}catch(e){ok=false;settle();return;}
+    if(!p||typeof p.then!=='function'){ok=false;settle();return;}
+    p.then(function(res){if(!res||!res.ok)ok=false;settle();},function(){ok=false;settle();});
+  })(urls[i]);}
 }
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -222,7 +226,12 @@ function show(locale){
   /* Bind handlers programmatically: inline onclick attributes can be blocked
      by CSP (script-src-attr) even when inline <script> is allowed. */
   var retryBtn=d.querySelector('#cep-js-fatal-retry');
-  if(retryBtn)retryBtn.addEventListener('click',function(){retry();});
+  if(retryBtn)retryBtn.addEventListener('click',function(){
+    /* Manual retry repairs the cache entries first, then reloads either way: a
+       fresh document against healthy entries is the only way out of a poisoned
+       cache, and the reload re-shows this page if the files are really gone. */
+    repairAll(function(){try{window.location.reload();}catch(e){}});
+  });
   var reloadBtn=d.querySelector('#cep-js-fatal-reload');
   if(reloadBtn)reloadBtn.addEventListener('click',function(){
     /* A manual refresh starts a clean session: drop both the retry flag and
@@ -233,42 +242,14 @@ function show(locale){
   });
 }
 
-function retry(){
-  var urls=F.slice();
-  for(var i=0;i<urls.length;i++){
-    (function(u){
-      /* CSS 资源用 <link rel="stylesheet"> 重试,JS 资源继续用 <script>。
-         link 元素没有 async/src,使用 href;onload/onerror 对两者都生效。 */
-      var isCss=u.split('?')[0].slice(-4)==='.css';
-      var el;
-      if(isCss){
-        el=document.createElement('link');
-        el.rel='stylesheet';
-        el.href=u+(u.indexOf('?')>=0?'&':'?')+'_r='+Date.now();
-      }else{
-        el=document.createElement('script');
-        el.async=true;
-        el.src=u+(u.indexOf('?')>=0?'&':'?')+'_r='+Date.now();
-      }
-      /* Loaded resources leave F (they are no longer failing); failed ones
-         (re-)enter F so the auto-retry outcome is accurate. */
-      el.onload=function(){
-        var idx=F.indexOf(u);
-        if(idx>=0)F.splice(idx,1);
-      };
-      el.onerror=function(){
-        if(F.indexOf(u)<0)F.push(u);
-      };
-      document.head.appendChild(el);
-    })(urls[i]);
-  }
-}
 
 var pollTimer=setInterval(function(){
   var el=document.getElementById('cep-js-fatal');
   /* hydration 完成后:移除覆盖层(若存在)并终止轮询,守卫正常收尾。 */
   if(!hydrated())return;
   if(el&&el.parentNode)el.parentNode.removeChild(el);
+  /* 页面已成功 hydration:回收本次修复预算,同一 tab 内后续失败仍可自动修复。 */
+  try{sessionStorage.removeItem(RETRY_KEY);}catch(e){}
   clearInterval(pollTimer);
 },1000);
 /* 返回清理函数(仅测试使用;生产环境返回值被丢弃):移除 error 监听并
